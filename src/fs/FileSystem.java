@@ -8,7 +8,7 @@ import java.util.Arrays;
 import java.util.List;
 
 /**
- * 文件系统核心层。最小原型实现目录创建/列出、文件创建/写入/查看。
+ * 文件系统核心层。实现目录/文件的创建、删除、读写与属性管理。
  */
 public class FileSystem {
     private final Disk disk;
@@ -71,6 +71,15 @@ public class FileSystem {
         disk.writeBlock(parentBlockNo, parentBlock);
     }
 
+    /** 返回当前 FAT 表快照，下标为盘块号。 */
+    public int[] getFatSnapshot() {
+        int[] snapshot = new int[BootBlock.TOTAL_BLOCKS];
+        for (int block = 0; block < snapshot.length; block++) {
+            snapshot[block] = fat.get(block);
+        }
+        return snapshot;
+    }
+
     public List<DirItem> listDirectory(String path) throws IOException {
         int blockNo = locateDirectoryBlock(path);
         byte[] block = disk.readBlock(blockNo);
@@ -84,10 +93,33 @@ public class FileSystem {
         return items;
     }
 
-    public void createFile(String path) throws IOException {
+    public void rd(String path) throws IOException {
+        path = normalizePath(path);
+        if (path.equals("/")) {
+            throw new FsException("不能删除根目录");
+        }
+        EntryLoc loc = locate(path);
+        if (!loc.item.isDirectory()) {
+            throw new FsException("不是目录: " + path);
+        }
+        byte[] dirBlock = disk.readBlock(loc.item.getStartBlock());
+        for (int i = 0; i < BootBlock.ENTRIES_PER_BLOCK; i++) {
+            if (!DirItem.isEmpty(dirBlock, i * BootBlock.DIR_ENTRY_SIZE)) {
+                throw new FsException("目录非空，无法删除: " + path);
+            }
+        }
+        DirItem.clear(loc.parentBlock, loc.index * BootBlock.DIR_ENTRY_SIZE);
+        disk.writeBlock(loc.parentBlockNo, loc.parentBlock);
+        fat.freeChain(loc.item.getStartBlock());
+    }
+
+    public void createFile(String path, int attribute) throws IOException {
         path = normalizePath(path);
         if (path.equals("/")) {
             throw new FsException("非法文件名");
+        }
+        if (attribute != BootBlock.ATTR_NORMAL && attribute != BootBlock.ATTR_SYSTEM) {
+            throw new FsException("非法文件属性（只读文件不允许创建）");
         }
         String parent = parentPath(path);
         String name = leafName(path);
@@ -107,9 +139,41 @@ public class FileSystem {
         byte[] fileBlock = new byte[BootBlock.BLOCK_SIZE];
         Arrays.fill(fileBlock, (byte) '#');
         disk.writeBlock(blockNo, fileBlock);
-        new DirItem(name, BootBlock.ATTR_NORMAL, blockNo, 1)
+        new DirItem(name, attribute, blockNo, 1)
                 .encode(parentBlock, freeIndex * BootBlock.DIR_ENTRY_SIZE);
         disk.writeBlock(parentBlockNo, parentBlock);
+    }
+
+    public void deleteFile(String path) throws IOException {
+        path = normalizePath(path);
+        EntryLoc loc = locate(path);
+        if (loc.item.isDirectory()) {
+            throw new FsException("不是文件: " + path);
+        }
+        if (oft.isOpen(path)) {
+            throw new FsException("文件已打开，禁止删除: " + path);
+        }
+        DirItem.clear(loc.parentBlock, loc.index * BootBlock.DIR_ENTRY_SIZE);
+        disk.writeBlock(loc.parentBlockNo, loc.parentBlock);
+        fat.freeChain(loc.item.getStartBlock());
+    }
+
+    public void changeAttribute(String path, int attribute) throws IOException {
+        path = normalizePath(path);
+        if (attribute != BootBlock.ATTR_NORMAL && attribute != BootBlock.ATTR_SYSTEM
+                && attribute != BootBlock.ATTR_READONLY) {
+            throw new FsException("非法文件属性");
+        }
+        EntryLoc loc = locate(path);
+        if (loc.item.isDirectory()) {
+            throw new FsException("只能修改文件属性: " + path);
+        }
+        if (oft.isOpen(path)) {
+            throw new FsException("文件已打开，不能修改属性: " + path);
+        }
+        loc.item.setAttribute(attribute);
+        loc.item.encode(loc.parentBlock, loc.index * BootBlock.DIR_ENTRY_SIZE);
+        disk.writeBlock(loc.parentBlockNo, loc.parentBlock);
     }
 
     public void openFile(String path, int flag) throws IOException {
@@ -207,6 +271,65 @@ public class FileSystem {
         }
         ptr.dnum = block;
         ptr.bnum = offset;
+    }
+
+    /** 用新内容整体替换文件，复用原盘块链并回收多余盘块。 */
+    public void rewriteFile(String path, String content) throws IOException {
+        path = normalizePath(path);
+        if (content == null) {
+            content = "";
+        }
+        if (content.indexOf('#') >= 0) {
+            throw new FsException("内容不能包含结束标记 '#'");
+        }
+        EntryLoc loc = locate(path);
+        if (loc.item.isDirectory()) {
+            throw new FsException("不是文件: " + path);
+        }
+        if (oft.isOpen(path)) {
+            throw new FsException("文件已打开，请先关闭: " + path);
+        }
+        if (loc.item.isReadOnly()) {
+            throw new FsException("只读文件不能修改: " + path);
+        }
+
+        byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
+        int needed = bytes.length / BootBlock.BLOCK_SIZE + 1;
+        List<Integer> blocks = chainBlocks(loc.item.getStartBlock());
+        if (blocks.size() + fat.countFree() < needed) {
+            throw new FsException("磁盘空间不足，无法保存");
+        }
+        while (blocks.size() < needed) {
+            int block = fat.allocate();
+            if (block < 0) {
+                throw new FsException("磁盘无空闲盘块");
+            }
+            blocks.add(block);
+        }
+
+        int index = 0;
+        for (int i = 0; i < needed; i++) {
+            byte[] data = new byte[BootBlock.BLOCK_SIZE];
+            Arrays.fill(data, (byte) '#');
+            int offset = 0;
+            while (offset < BootBlock.BLOCK_SIZE && index < bytes.length) {
+                data[offset++] = bytes[index++];
+            }
+            disk.writeBlock(blocks.get(i), data);
+        }
+        for (int i = 0; i < needed - 1; i++) {
+            fat.set(blocks.get(i), blocks.get(i + 1));
+        }
+        fat.set(blocks.get(needed - 1), BootBlock.FAT_EOF);
+        for (int i = needed; i < blocks.size(); i++) {
+            fat.set(blocks.get(i), BootBlock.FAT_FREE);
+        }
+        fat.save();
+
+        new DirItem(loc.item.getName(), loc.item.getAttribute(),
+                blocks.get(0), needed)
+                .encode(loc.parentBlock, loc.index * BootBlock.DIR_ENTRY_SIZE);
+        disk.writeBlock(loc.parentBlockNo, loc.parentBlock);
     }
 
     public void closeFile(String path) throws IOException {
@@ -309,12 +432,18 @@ public class FileSystem {
 
     public String typeFile(String path) throws IOException {
         path = normalizePath(path);
+        if (oft.isOpen(path)) {
+            throw new FsException("文件已打开，无法查看: " + path);
+        }
+        return previewFile(path);
+    }
+
+    /** 读取文件全文，忽略打开状态，供写入前预览。 */
+    public String previewFile(String path) throws IOException {
+        path = normalizePath(path);
         EntryLoc loc = locate(path);
         if (loc.item.isDirectory()) {
             throw new FsException("不是文件: " + path);
-        }
-        if (oft.isOpen(path)) {
-            throw new FsException("文件已打开，无法查看: " + path);
         }
         return new String(readAllBytes(loc.item.getStartBlock()), StandardCharsets.UTF_8);
     }
@@ -449,6 +578,31 @@ public class FileSystem {
             block = next;
         }
         throw new FsException("文件 FAT 链损坏");
+    }
+
+    private List<Integer> chainBlocks(int startBlock) throws IOException {
+        if (startBlock < 3 || startBlock >= BootBlock.TOTAL_BLOCKS
+                || fat.get(startBlock) == BootBlock.FAT_FREE
+                || fat.get(startBlock) == BootBlock.FAT_BAD) {
+            throw new FsException("文件 FAT 链损坏");
+        }
+        List<Integer> blocks = new ArrayList<>();
+        boolean[] visited = new boolean[BootBlock.TOTAL_BLOCKS];
+        int block = startBlock;
+        while (block >= 3 && block < BootBlock.TOTAL_BLOCKS && !visited[block]) {
+            visited[block] = true;
+            blocks.add(block);
+            int next = fat.get(block);
+            if (next == BootBlock.FAT_EOF || next == BootBlock.FAT_BAD
+                    || next == BootBlock.FAT_FREE) {
+                break;
+            }
+            if (next < 3 || next >= BootBlock.TOTAL_BLOCKS) {
+                throw new FsException("文件 FAT 链损坏");
+            }
+            block = next;
+        }
+        return blocks;
     }
 
     private byte[] readAllBytes(int startBlock) throws IOException {

@@ -1,5 +1,6 @@
 package gui;
 
+import fs.BootBlock;
 import fs.DirItem;
 import fs.FileSystem;
 import fs.OFT;
@@ -17,7 +18,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 最小原型主窗口：目录树、文件列表、日志区、右键菜单。
+ * 主窗口：包含目录树、文件列表、日志区、右键菜单
  */
 public class MainFrame extends JFrame {
     private final FileSystem fs;
@@ -31,14 +32,17 @@ public class MainFrame extends JFrame {
     private final JTextArea output = new JTextArea();
     private final JLabel pathLabel = new JLabel();
     private final List<DirItem> currentItems = new ArrayList<>();
+    private DiskDialog diskDialog;
 
+    //文件主窗口
     public MainFrame(FileSystem fs) {
         this.fs = fs;
-        setTitle("简易 FAT 文件系统模拟器（最小原型）");
+        setTitle("简易 FAT 文件系统模拟器");
         setDefaultCloseOperation(DO_NOTHING_ON_CLOSE);
         setSize(900, 600);
         setLocationRelativeTo(null);
 
+        //左侧目录树
         treeModel = new DefaultTreeModel(rootNode);
         tree = new JTree(treeModel);
         tree.setRootVisible(true);
@@ -56,8 +60,13 @@ public class MainFrame extends JFrame {
         output.setFont(new Font("Microsoft YaHei", Font.PLAIN, 13));
 
         pathLabel.setBorder(BorderFactory.createEmptyBorder(4, 6, 4, 6));
+        JButton diskButton = new JButton("磁盘管理");
+        diskButton.addActionListener(e -> showDiskDialog());
+        JPanel topBar = new JPanel(new BorderLayout());
+        topBar.add(pathLabel, BorderLayout.CENTER);
+        topBar.add(diskButton, BorderLayout.EAST);
         JPanel tablePanel = new JPanel(new BorderLayout());
-        tablePanel.add(pathLabel, BorderLayout.NORTH);
+        tablePanel.add(topBar, BorderLayout.NORTH);
         tablePanel.add(new JScrollPane(table), BorderLayout.CENTER);
 
         JSplitPane rightSplit = new JSplitPane(JSplitPane.VERTICAL_SPLIT,
@@ -88,7 +97,7 @@ public class MainFrame extends JFrame {
 
         refreshTree();
         refreshTable();
-        appendLog("文件系统已启动。右键目录树创建目录，右键表格空白处创建文件，双击文件写入内容。");
+        appendLog("文件系统已启动。右键目录树创建目录与创建文件，双击文件写入内容。");
     }
 
     private void refreshTree() {
@@ -173,6 +182,15 @@ public class MainFrame extends JFrame {
         }
     }
 
+    private void showDiskDialog() {
+        if (diskDialog != null && diskDialog.isShowing()) {
+            diskDialog.toFront();
+            return;
+        }
+        diskDialog = new DiskDialog(this, fs);
+        diskDialog.setVisible(true);
+    }
+
     private void navigateTo(String path) {
         DefaultMutableTreeNode node = findNode(rootNode, path);
         if (node != null) {
@@ -198,23 +216,100 @@ public class MainFrame extends JFrame {
         return name;
     }
 
-    private String promptContent() {
-        JTextArea area = new JTextArea(8, 40);
-        area.setLineWrap(true);
-        area.setWrapStyleWord(true);
-        int result = JOptionPane.showConfirmDialog(this, new JScrollPane(area),
-                "输入要追加写入的内容", JOptionPane.OK_CANCEL_OPTION,
-                JOptionPane.PLAIN_MESSAGE);
-        return result == JOptionPane.OK_OPTION ? area.getText() : null;
+    private String promptContent(String path) {
+        String existing;
+        try {
+            existing = fs.previewFile(path);
+        } catch (Exception ex) {
+            showError("读取现有内容失败: " + ex.getMessage());
+            return null;
+        }
+        JTextArea existingArea = new JTextArea(existing);
+        existingArea.setEditable(false);
+        existingArea.setLineWrap(true);
+        existingArea.setWrapStyleWord(true);
+        JScrollPane existingPane = new JScrollPane(existingArea);
+        existingPane.setPreferredSize(new Dimension(480, 180));
+        existingPane.setBorder(BorderFactory.createTitledBorder("现有内容（只读）"));
+
+        JTextArea inputArea = new JTextArea(8, 40);
+        inputArea.setLineWrap(true);
+        inputArea.setWrapStyleWord(true);
+        JScrollPane inputPane = new JScrollPane(inputArea);
+        inputPane.setPreferredSize(new Dimension(480, 140));
+        inputPane.setBorder(BorderFactory.createTitledBorder("追加内容"));
+
+        JPanel panel = new JPanel(new BorderLayout(0, 6));
+        panel.add(existingPane, BorderLayout.CENTER);
+        panel.add(inputPane, BorderLayout.SOUTH);
+
+        int result = JOptionPane.showOptionDialog(this, panel,
+                "写入文件 - " + path, JOptionPane.DEFAULT_OPTION,
+                JOptionPane.PLAIN_MESSAGE, null,
+                new Object[]{"保存", "取消"}, "保存");
+        return result == 0 ? inputArea.getText() : null;
+    }
+
+    private Integer promptFileAttribute() {
+        Object[] options = {"普通文件", "系统文件"};
+        int choice = JOptionPane.showOptionDialog(this, "请选择文件属性", "新建文件",
+                JOptionPane.DEFAULT_OPTION, JOptionPane.QUESTION_MESSAGE,
+                null, options, options[0]);
+        if (choice < 0) {
+            return null;
+        }
+        return choice == 0 ? BootBlock.ATTR_NORMAL : BootBlock.ATTR_SYSTEM;
+    }
+
+    private void createFileDialog(String dirPath) {
+        String name = promptName("新建文件");
+        if (name == null) {
+            return;
+        }
+        Integer attribute = promptFileAttribute();
+        if (attribute == null) {
+            return;
+        }
+        doAction("新建文件", () -> {
+            fs.createFile(join(dirPath, name), attribute);
+            refreshTable();
+        });
+    }
+
+    private void deleteDirectoryDialog(String path) {
+        doAction("删除目录 " + path, () -> {
+            fs.rd(path);
+            if (currentPath.equals(path) || currentPath.startsWith(path + "/")) {
+                currentPath = parentPath(path);
+            }
+            refreshTree();
+            refreshTable();
+        });
+    }
+
+    private void changeAttributeDialog(String path, String name) {
+        Object[] options = {"普通文件", "系统文件", "只读文件"};
+        int choice = JOptionPane.showOptionDialog(this, "请选择新属性", "修改属性",
+                JOptionPane.DEFAULT_OPTION, JOptionPane.QUESTION_MESSAGE,
+                null, options, options[0]);
+        if (choice < 0) {
+            return;
+        }
+        int attribute = choice == 0 ? BootBlock.ATTR_NORMAL
+                : choice == 1 ? BootBlock.ATTR_SYSTEM : BootBlock.ATTR_READONLY;
+        doAction("修改属性 " + name, () -> {
+            fs.changeAttribute(path, attribute);
+            refreshTable();
+        });
     }
 
     private void writeFileDialog(DirItem item) {
-        String content = promptContent();
+        String path = join(currentPath, item.getName());
+        String content = promptContent(path);
         if (content == null) {
             return;
         }
         doAction("写入文件 " + item.getName(), () -> {
-            String path = join(currentPath, item.getName());
             fs.openFile(path, OFT.WRITE);
             try {
                 fs.writeFile(path, content);
@@ -225,6 +320,61 @@ public class MainFrame extends JFrame {
         });
     }
 
+    private void editFileDialog(String path, DirItem item) {
+        if (item.isReadOnly()) {
+            showError("只读文件不能编辑: " + path);
+            return;
+        }
+        if (fs.isOpen(path)) {
+            showError("文件已打开，请先关闭: " + path);
+            return;
+        }
+        String content;
+        try {
+            content = fs.previewFile(path);
+        } catch (Exception ex) {
+            showError("读取文件失败: " + ex.getMessage());
+            return;
+        }
+
+        JTextArea area = new JTextArea(content);
+        area.setLineWrap(true);
+        area.setWrapStyleWord(true);
+        area.setFont(new Font("Microsoft YaHei", Font.PLAIN, 13));
+        JScrollPane scroll = new JScrollPane(area);
+        scroll.setPreferredSize(new Dimension(640, 420));
+
+        JDialog dialog = new JDialog(this, "编辑文件 - " + path, true);
+        JPanel buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT));
+        JButton save = new JButton("保存");
+        JButton cancel = new JButton("取消");
+        buttons.add(save);
+        buttons.add(cancel);
+
+        save.addActionListener(a -> {
+            try {
+                fs.rewriteFile(path, area.getText());
+            } catch (Exception ex) {
+                String message = "保存失败: " + ex.getMessage();
+                appendLog("错误: " + message);
+                JOptionPane.showMessageDialog(dialog, message, "错误",
+                        JOptionPane.ERROR_MESSAGE);
+                return;
+            }
+            appendLog("保存文件 " + path + "：成功");
+            refreshTable();
+            dialog.dispose();
+        });
+        cancel.addActionListener(a -> dialog.dispose());
+
+        dialog.add(new JLabel(" 提示：内容不能包含字符 #"), BorderLayout.NORTH);
+        dialog.add(scroll, BorderLayout.CENTER);
+        dialog.add(buttons, BorderLayout.SOUTH);
+        dialog.setSize(720, 520);
+        dialog.setLocationRelativeTo(this);
+        dialog.setVisible(true);
+    }
+
     private void doAction(String title, FsAction action) {
         try {
             action.run();
@@ -232,6 +382,17 @@ public class MainFrame extends JFrame {
         } catch (Exception ex) {
             showError(title + "失败: " + ex.getMessage());
         }
+    }
+
+    private void showTextWindow(String title, String content) {
+        JDialog dialog = new JDialog(this, title, false);
+        JTextArea area = new JTextArea(content);
+        area.setEditable(false);
+        area.setFont(new Font("Microsoft YaHei", Font.PLAIN, 13));
+        dialog.add(new JScrollPane(area), BorderLayout.CENTER);
+        dialog.setSize(640, 480);
+        dialog.setLocationRelativeTo(this);
+        dialog.setVisible(true);
     }
 
     private void appendLog(String message) {
@@ -246,6 +407,11 @@ public class MainFrame extends JFrame {
 
     private static String join(String dir, String name) {
         return "/".equals(dir) ? "/" + name : dir + "/" + name;
+    }
+
+    private static String parentPath(String path) {
+        int index = path.lastIndexOf('/');
+        return index <= 0 ? "/" : path.substring(0, index);
     }
 
     private interface FsAction {
@@ -309,17 +475,13 @@ public class MainFrame extends JFrame {
             menu.add(newDir);
 
             JMenuItem newFile = new JMenuItem("新建文件");
-            newFile.addActionListener(a -> {
-                String name = promptName("新建文件");
-                if (name == null) {
-                    return;
-                }
-                doAction("新建文件", () -> {
-                    fs.createFile(join(dir.path, name));
-                    refreshTable();
-                });
-            });
+            newFile.addActionListener(a -> createFileDialog(dir.path));
             menu.add(newFile);
+
+            JMenuItem deleteDir = new JMenuItem("删除目录");
+            deleteDir.setEnabled(!"/".equals(dir.path));
+            deleteDir.addActionListener(a -> deleteDirectoryDialog(dir.path));
+            menu.add(deleteDir);
 
             JMenuItem refresh = new JMenuItem("刷新");
             refresh.addActionListener(a -> {
@@ -369,9 +531,14 @@ public class MainFrame extends JFrame {
                 table.setRowSelectionInterval(row, row);
                 DirItem item = currentItems.get(row);
                 if (item.isDirectory()) {
+                    String path = join(currentPath, item.getName());
                     JMenuItem open = new JMenuItem("打开目录");
-                    open.addActionListener(a -> navigateTo(join(currentPath, item.getName())));
+                    open.addActionListener(a -> navigateTo(path));
                     menu.add(open);
+
+                    JMenuItem delete = new JMenuItem("删除目录");
+                    delete.addActionListener(a -> deleteDirectoryDialog(path));
+                    menu.add(delete);
                 } else {
                     String path = join(currentPath, item.getName());
 
@@ -418,14 +585,17 @@ public class MainFrame extends JFrame {
                     JMenuItem view = new JMenuItem("查看内容");
                     view.addActionListener(a -> doAction("查看内容", () -> {
                         String content = fs.typeFile(path);
-                        appendLog("===== " + item.getName() + " 的内容 =====");
-                        appendLog(content.isEmpty() ? "(空文件)" : content);
+                        showTextWindow("查看文件 - " + path, content);
                     }));
                     menu.add(view);
 
+                    JMenuItem edit = new JMenuItem("编辑内容");
+                    edit.addActionListener(a -> editFileDialog(path, item));
+                    menu.add(edit);
+
                     JMenuItem write = new JMenuItem("写入内容");
                     write.addActionListener(a -> {
-                        String content = promptContent();
+                        String content = promptContent(path);
                         if (content == null) {
                             return;
                         }
@@ -453,19 +623,23 @@ public class MainFrame extends JFrame {
                         refreshTable();
                     }));
                     menu.add(close);
+
+                    JMenuItem change = new JMenuItem("修改属性");
+                    change.addActionListener(a ->
+                            changeAttributeDialog(path, item.getName()));
+                    menu.add(change);
+
+                    JMenuItem delete = new JMenuItem("删除文件");
+                    delete.addActionListener(a ->
+                            doAction("删除文件 " + item.getName(), () -> {
+                                fs.deleteFile(path);
+                                refreshTable();
+                            }));
+                    menu.add(delete);
                 }
             } else {
                 JMenuItem newFile = new JMenuItem("新建文件");
-                newFile.addActionListener(a -> {
-                    String name = promptName("新建文件");
-                    if (name == null) {
-                        return;
-                    }
-                    doAction("新建文件", () -> {
-                        fs.createFile(join(currentPath, name));
-                        refreshTable();
-                    });
-                });
+                newFile.addActionListener(a -> createFileDialog(currentPath));
                 menu.add(newFile);
 
                 JMenuItem refresh = new JMenuItem("刷新");

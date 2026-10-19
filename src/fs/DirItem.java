@@ -87,6 +87,10 @@ public class DirItem {
         return attribute;
     }
 
+    public void setAttribute(int attribute) {
+        this.attribute = attribute;
+    }
+
     public int getStartBlock() {
         return startBlock;
     }
